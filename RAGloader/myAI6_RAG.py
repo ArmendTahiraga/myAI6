@@ -12,7 +12,7 @@ please credit the author when you use or adapt this code.
 All pipeline classes, helpers, and utilities for the myAI6 RAG system.
 Import into a notebook or script and use with minimal boilerplate.
 
-The pipeline: parse (Unstructured jobs API, with page-furniture removal,
+The pipeline: parse (Unstructured partition endpoint, with page-furniture removal,
 formula-to-LaTeX and figure re-rendering) -> parent/child chunking ->
 LLM enrichment (keywords, summaries, questions) -> proposition decomposition ->
 image hosting (Cloudinary or SFTP) -> upsert into Pinecone (integrated
@@ -76,7 +76,10 @@ DEFAULT_CHUNKING_CONFIG = {
     "hi_res": True,                    # analyze page layout visually (needed for figures/tables);
                                        # False falls back to the faster "auto" strategy
     "extract_image_block_types": ["Image", "Table"],  # visual elements to cut out as images
-    "api_timeout": 600,                # max seconds to wait for a parsing job (~80-page papers fit)
+    "api_timeout": 1800,               # max seconds to wait for a parsing request; whole-document hi_res runs
+                                       # ~5 s/page, so 1800 covers ~300-page documents
+    "pdf_split_pages": False,          # True = SDK sends PDF in parallel ~4-page batches (faster) but the
+                                       # chunker then runs per batch and breaks chunks at batch edges
 
     # --- Page furniture removal ---
     # Drop running headers/footers/page numbers and rotated margin watermarks
@@ -160,8 +163,12 @@ class PipelineConfig:
     pinecone_api_key: str = ""
     openai_api_key: str = ""  # optional - only used when vision_model is a GPT model and/or moderations endpoint used
 
-    # Unstructured jobs API host (bare host, no /api/v1 path - the SDK appends it)
-    unstructured_api_url: str = "https://platform-api.transform.unstructured.io"
+    # Unstructured Transform partition endpoint host (bare host - the SDK appends
+    # /general/v0/general). The former jobs/workflows host
+    # (platform-api.transform.unstructured.io) now needs an Enterprise "Pipelines"
+    # plan and answers 503 job_authorization_failed on Free/Pay-As-You-Go accounts;
+    # it is mapped to this host automatically.
+    unstructured_api_url: str = "https://api.transform.unstructured.io"
 
     # Pinecone
     pinecone_index_host: str = ""
@@ -576,12 +583,23 @@ class DocumentSource:
 # ═════════════════════════════════════════════════════════════════
 
 class StructuralParser:
-    """Unstructured jobs-API parser: one job per document with a partition node
-    and a chunk_by_title node; both node outputs are downloaded separately
-    (raw elements for hierarchy/figures/tables, chunked elements for parents)."""
+    """Unstructured partition-endpoint parser: one request per document, partitioned
+    with chunk_by_title in one partition-endpoint call. Two element lists are
+    used downstream: the unchunked elements (section hierarchy, figures, tables,
+    captions, formulas, page-furniture removal) and the chunked elements (parent
+    chunks). The unchunked list is rebuilt from metadata.orig_elements of the
+    chunks, which carries every element with its full metadata."""
+
+    TRANSFORM_API_URL = "https://api.transform.unstructured.io"
+    _LEGACY_JOBS_HOSTS = ("platform-api.transform.unstructured.io", "platform.unstructuredapp.io")
 
     def __init__(self, api_key, config, server_url, pcfg: "PipelineConfig | None" = None):
-        self.client = UnstructuredClient(api_key_auth=api_key, server_url=server_url)
+        url = (server_url or "").rstrip("/") or self.TRANSFORM_API_URL
+        if any(h in url for h in self._LEGACY_JOBS_HOSTS):
+            print(f"   Note: {url} is the jobs/workflows API (Enterprise 'Pipelines' plan). "
+                  f"Using the partition endpoint at {self.TRANSFORM_API_URL} instead.")
+            url = self.TRANSFORM_API_URL
+        self.client = UnstructuredClient(api_key_auth=api_key, server_url=url)
         self.cfg = config
         self.pcfg = pcfg  # needed for formula transcription (vision model)
 
@@ -1064,81 +1082,79 @@ class StructuralParser:
             print(f"   Re-rendered {rerendered}/{len(figures)} figures from PDF regions")
 
     def _run_partition_job(self, filepath: Path) -> tuple[list[dict], list[dict]]:
-        """Create one Unstructured job with partition + chunk_by_title nodes,
-        poll until it finishes, and return (raw_elements, chunked_elements)."""
-        partition_node = {
-            "name": "Partitioner", "type": "partition", "subtype": "unstructured_api",
-            "settings": {
-                "strategy": "hi_res" if self.cfg["hi_res"] else "auto",
-                "include_page_breaks": True,
-                "infer_table_structure": True,
-                "coordinates": True,
-                "extract_image_block_types": [t.lower() for t in self.cfg["extract_image_block_types"]],
-            },
-        }
-        chunk_node = {
-            "name": "Chunker", "type": "chunk", "subtype": "chunk_by_title",
-            "settings": {
-                "max_characters": self.cfg["parent_max_characters"],
-                "new_after_n_chars": self.cfg["parent_new_after"],
-                "combine_text_under_n_chars": self.cfg["parent_combine_under"],
-                "overlap": self.cfg["parent_overlap"],
-                "include_orig_elements": True,
-            },
-        }
+        """Partition + chunk_by_title in ONE call to the Unstructured partition
+        endpoint and return (raw_elements, chunked_elements).
+
+        The chunked output carries every original element (zlib+base64 JSON in
+        metadata.orig_elements, incl. image_base64 / coordinates / text_as_html),
+        so the unchunked element list is rebuilt from it instead of paying for a
+        second pass."""
+        from unstructured_client.utils import RetryConfig, BackoffStrategy
+        from unstructured_client.models.errors import SDKError
+
         content = filepath.read_bytes()
         ctype, _ = mimetypes.guess_type(str(filepath))
+        params = shared.PartitionParameters(
+            files=shared.Files(content=content, file_name=filepath.name,
+                               content_type=ctype or "application/octet-stream"),
+            strategy=shared.Strategy.HI_RES if self.cfg["hi_res"] else shared.Strategy.AUTO,
+            include_page_breaks=True,
+            pdf_infer_table_structure=True,
+            coordinates=True,
+            unique_element_ids=True,
+            extract_image_block_types=[t.lower() for t in self.cfg["extract_image_block_types"]],
+            chunking_strategy="by_title",
+            max_characters=self.cfg["parent_max_characters"],
+            new_after_n_chars=self.cfg["parent_new_after"],
+            combine_under_n_chars=self.cfg["parent_combine_under"],
+            overlap=self.cfg["parent_overlap"],
+            include_orig_elements=True,
+            # The SDK can cut a PDF into ~4-page batches and send them in parallel. The
+            # server then runs chunk_by_title on EACH batch separately, forcing chunk
+            # breaks (and tiny fragments) at every batch edge. Whole-document processing
+            # reproduces the old jobs-API output exactly, so it is the default; the batch
+            # mode is 3-4x faster and only worth it for very long PDFs.
+            split_pdf_page=bool(self.cfg.get("pdf_split_pages", False)),
+        )
         # Bounded retries on 5xx (the SDK default backs off for a very long time):
         # 1s -> 10s intervals, give up after ~2 minutes with a clear error.
-        from unstructured_client.utils import RetryConfig, BackoffStrategy
         retry = RetryConfig("backoff", BackoffStrategy(1000, 10000, 1.5, 120000), True)
-        try:
-            resp = self.client.jobs.create_job(request=operations.CreateJobRequest(
-                body_create_job=shared.BodyCreateJob(
-                    request_data=json.dumps({"job_nodes": [partition_node, chunk_node]}),
-                    input_files=[shared.InputFiles(
-                        content=content, file_name=filepath.name,
-                        content_type=ctype or "application/octet-stream")],
-                )), retries=retry)
-        except Exception as e:
-            raise RuntimeError(
-                f"Unstructured could not create a job for {filepath.name} after ~2 minutes of retries "
-                f"({str(e)[:120]}). Persistent 500s mean a service-side problem or an account/credit issue - "
-                f"check https://status.unstructured.io and your Unstructured dashboard, then re-run."
-            ) from e
-        job = resp.job_information
-        print(f"   Unstructured job {job.id} submitted, waiting...")
+        print(f"   Partitioning via {self.client.sdk_configuration.server_url} ...")
         t0 = time.time()
-        while True:
-            time.sleep(5)
-            job = self.client.jobs.get_job(
-                request=operations.GetJobRequest(job_id=job.id)).job_information
-            status = str(job.status).rsplit(".", 1)[-1].upper()
-            if status in ("COMPLETED", "FAILED", "STOPPED", "CANCELLED"):
-                break
-            if time.time() - t0 > self.cfg["api_timeout"]:
-                raise TimeoutError(
-                    f"Unstructured job {job.id} did not finish within {self.cfg['api_timeout']}s")
-        if status != "COMPLETED":
-            details = ""
-            try:
-                failed = self.client.jobs.get_job_failed_files(
-                    request=operations.GetJobFailedFilesRequest(job_id=job.id))
-                details = f" | failed files: {failed.job_failed_files}"
-            except Exception:
-                pass
-            raise RuntimeError(f"Unstructured job {job.id} ended with status {status}{details}")
-        print(f"   Job completed in {time.time() - t0:.0f}s")
-        raw, chunked = [], []
-        for nf in job.output_node_files or []:
-            out = self.client.jobs.download_job_output(
-                request=operations.DownloadJobOutputRequest(
-                    job_id=job.id, file_id=nf.file_id, node_id=nf.node_id))
-            data = out.any if isinstance(out.any, list) else []
-            if nf.node_type == "partition":
-                raw = data
-            elif nf.node_type == "chunk":
-                chunked = data
+        try:
+            resp = self.client.general.partition(
+                request=operations.PartitionRequest(partition_parameters=params), retries=retry,
+                timeout_ms=int(self.cfg["api_timeout"]) * 1000)
+        except SDKError as e:
+            status = getattr(getattr(e, "raw_response", None), "status_code", 0) or 0
+            body = (getattr(e, "body", "") or str(e))[:200]
+            if status in (401, 403):
+                raise RuntimeError(
+                    f"Unstructured rejected the API key ({status}): {body}. Create/check the key under "
+                    f"API Keys at https://platform.unstructured.io and make sure it is enabled.") from None
+            if status == 402 or "quota" in body.lower():
+                raise RuntimeError(
+                    f"Unstructured refused {filepath.name} ({status}): {body}. The account's page quota "
+                    f"is used up - check Billing/Usage at https://platform.unstructured.io.") from None
+            raise RuntimeError(
+                f"Unstructured could not partition {filepath.name} ({status}): {body}. Persistent 5xx "
+                f"mean a service-side problem - check https://status.unstructured.io and re-run.") from e
+        chunked = [e for e in (resp.elements or []) if isinstance(e, dict)]
+        print(f"   Partitioned in {time.time() - t0:.0f}s")
+
+        # Rebuild the unchunked element list from the chunks' orig_elements
+        raw, seen = [], set()
+        for ch in chunked:
+            for oe in self._parse_orig_elements(ch.get("metadata", {})):
+                eid = oe.get("element_id")
+                if eid and eid in seen:
+                    continue  # overlap between chunks repeats elements
+                if eid:
+                    seen.add(eid)
+                oe.setdefault("metadata", {}).setdefault("filename", filepath.name)
+                raw.append(oe)
+        if not raw:  # unexpected: server returned chunks without orig_elements
+            raw = chunked
         return raw, chunked
 
     def _get_page_numbers(self, meta, orig):
