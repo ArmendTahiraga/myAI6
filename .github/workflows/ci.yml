@@ -1,0 +1,53 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+# If you push again while CI is still running, cancel the old run
+concurrency:
+    group: ci-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    web:
+        name: Typecheck, test, lint
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@v5
+
+            - uses: actions/setup-node@v5
+              with:
+                  node-version: 24
+                  cache: npm
+
+            - name: Install dependencies
+              run: npm ci
+
+            - name: Typecheck
+              run: npm run typecheck
+
+            - name: Unit tests
+              run: npm test
+
+            - name: Lint (not required yet, 78 existing problems)
+              run: npm run lint
+              continue-on-error: true
+    rag-loader:
+        name: RAG loader checks
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - uses: actions/checkout@v5
+
+            - name: Python syntax check
+              run: python3 -m py_compile RAGloader/myAI6_RAG.py
+
+            - name: No real API keys committed
+              run: |
+                  if git grep -lIE '(sk-ant-|sk-proj-|pcsk_)[A-Za-z0-9_-]{20,}'; then
+                    echo "::error::The files above contain what looks like a real API key. Remove it and rotate the key."
+                    exit 1
+                  fi
